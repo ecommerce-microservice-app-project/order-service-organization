@@ -152,6 +152,17 @@ jobs:
         
         echo "Deploying image: $IMAGE_NAME to namespace: ${{ env.KUBERNETES_NAMESPACE }}"
         
+        # Verificar y eliminar pods antiguos si existen (para strategy Recreate)
+        echo "Verificando pods existentes..."
+        EXISTING_PODS=$(kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }} -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+        if [ -n "$EXISTING_PODS" ]; then
+          echo "Pods existentes encontrados: $EXISTING_PODS"
+          echo "Eliminando pods antiguos para permitir Recreate strategy..."
+          kubectl delete pods -n ${{ env.KUBERNETES_NAMESPACE }} -l app=${{ env.SERVICE_NAME }} --wait=false || true
+          echo "Esperando 10 segundos para que los pods se eliminen..."
+          sleep 10
+        fi
+        
         # Create temporary deployment file from infra repo
         cp infra/k8s/order-service/deployment.yaml deployment.tmp.yaml
         
@@ -177,6 +188,20 @@ jobs:
         echo "Tag estático detectado: ${{ env.IMAGE_TAG }}"
         echo "Forzando rollout restart para asegurar descarga de nueva imagen..."
         kubectl rollout restart deployment/${{ env.SERVICE_NAME }} -n ${{ env.KUBERNETES_NAMESPACE }}
+        
+    - name: Check cluster resources
+      run: |
+        echo "=== Verificando nodos disponibles ==="
+        kubectl get nodes -o wide || true
+        echo ""
+        echo "=== Verificando taints en nodos ==="
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints[*].key}{"="}{.spec.taints[*].value}{":"}{.spec.taints[*].effect}{"\n"}{end}' || true
+        echo ""
+        echo "=== Verificando recursos disponibles ==="
+        kubectl top nodes 2>/dev/null || echo "kubectl top no disponible (requiere metrics-server)"
+        echo ""
+        echo "=== Verificando pods en el namespace ==="
+        kubectl get pods -n ${{ env.KUBERNETES_NAMESPACE }} || true
         
     - name: Check pod status before waiting
       run: |
@@ -213,6 +238,29 @@ jobs:
           if [ -n "$POD_NAME" ]; then
             POD_STATUS=$(kubectl get pod $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
             echo "Pod status: $POD_STATUS (elapsed: ${elapsed}s)"
+            
+            # Si el pod está en Pending por más de 60 segundos, mostrar detalles
+            if [ "$POD_STATUS" = "Pending" ] && [ $elapsed -ge 60 ]; then
+              echo "Pod en Pending por más de 60s. Investigando causa..."
+              kubectl describe pod $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} || true
+              echo ""
+              echo "=== Verificando nodos disponibles ==="
+              kubectl get nodes -o wide || true
+              echo ""
+              echo "=== Verificando taints en nodos ==="
+              kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.taints[*].key}{"="}{.spec.taints[*].value}{":"}{.spec.taints[*].effect}{"\n"}{end}' || true
+              echo ""
+              echo "=== Verificando recursos disponibles ==="
+              kubectl top nodes 2>/dev/null || echo "kubectl top no disponible"
+              # Si está en Pending por más de 120s, salir con error
+              if [ $elapsed -ge 120 ]; then
+                echo "ERROR: Pod en Pending por más de 120s. Posibles causas:"
+                echo "1. No hay nodos disponibles con las tolerations correctas"
+                echo "2. Recursos insuficientes en los nodos"
+                echo "3. Problema con imagePullPolicy o registry"
+                exit 1
+              fi
+            fi
             
             # Si el pod está en CrashLoopBackOff o Error, mostrar logs y salir
             if [ "$POD_STATUS" = "Failed" ] || kubectl get pod $POD_NAME -n ${{ env.KUBERNETES_NAMESPACE }} -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null | grep -q "CrashLoopBackOff"; then
